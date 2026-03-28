@@ -522,7 +522,7 @@
                 <span class="font-heading text-xl tracking-tighter uppercase">Blox<span class="roblox-red">Guide</span></span>
             </div>
             <p class="text-slate-500 text-sm italic">
-                &copy; 2024 BloxGuide. Not affiliated with Roblox Corporation. 
+                &copy; 2026 BloxGuide. Not affiliated with Roblox Corporation. 
                 <br>Go build something amazing.
             </p>
         </div>
@@ -570,6 +570,8 @@
             const PENDING_KEY = 'bloxguide-pending-unlock';
             const LAST_RETURN_KEY = 'bloxguide-last-return';
             const RETURN_WINDOW_MS = 1000 * 60 * 30;
+            const NAV_MARKER_KEY = 'bloxguide-nav-away';
+            const WINDOW_NAME_KEY = 'BG_PENDING_UNLOCK';
 
             const stepCards = Array.from(document.querySelectorAll('.step-card[data-step]'));
             const revealButtons = Array.from(document.querySelectorAll('.reveal-btn'));
@@ -631,6 +633,7 @@
             function clearPendingUnlock() {
                 sessionStorage.removeItem(PENDING_KEY);
                 localStorage.removeItem(PENDING_KEY);
+                localStorage.removeItem(LAST_RETURN_KEY);
             }
 
             function showToast(message, isSuccess = true) {
@@ -714,12 +717,23 @@
                 };
                 writePendingUnlock(payload);
                 localStorage.setItem(LAST_RETURN_KEY, JSON.stringify({ step, token, startedAt: payload.startedAt }));
+                sessionStorage.setItem(NAV_MARKER_KEY, JSON.stringify({
+                    step,
+                    token,
+                    startedAt: payload.startedAt,
+                    leftSite: false,
+                    hiddenAtLeastOnce: false
+                }));
 
-                const directUrl = 'https://link-target.net/563182/D5zel6LjQ8Na';
+                try {
+                    window.name = `${WINDOW_NAME_KEY}:${token}:${step}`;
+                } catch (error) {}
+
+                const directUrl = LINKVERTISE_URL;
                 const fallbackLink = document.createElement('a');
                 fallbackLink.href = directUrl;
                 fallbackLink.target = '_self';
-                fallbackLink.rel = 'noreferrer';
+                fallbackLink.rel = 'noopener';
                 fallbackLink.style.display = 'none';
                 document.body.appendChild(fallbackLink);
 
@@ -777,6 +791,23 @@
                 applyUnlockStates();
             }
 
+            function readNavMarker() {
+                try {
+                    const raw = sessionStorage.getItem(NAV_MARKER_KEY);
+                    return raw ? JSON.parse(raw) : null;
+                } catch (error) {
+                    return null;
+                }
+            }
+
+            function writeNavMarker(payload) {
+                sessionStorage.setItem(NAV_MARKER_KEY, JSON.stringify(payload));
+            }
+
+            function clearNavMarker() {
+                sessionStorage.removeItem(NAV_MARKER_KEY);
+            }
+
             function hasReturnMarkers(pending) {
                 const url = new URL(window.location.href);
                 const queryStep = Number(url.searchParams.get('bg_step'));
@@ -784,12 +815,20 @@
                 const hasReturnFlag = url.searchParams.get('bg_return') === '1';
                 const referrer = document.referrer || '';
                 const hasKnownReferrer = /linkvertise|link-target\.net|link-center\.net|link-hub\.net/i.test(referrer);
+                const navMarker = readNavMarker();
+                const windowName = String(window.name || '');
+                const hasWindowNameMarker = windowName === `${WINDOW_NAME_KEY}:${pending.token}:${pending.step}`;
+                const hasNavEvidence = !!navMarker && Number(navMarker.step) === Number(pending.step) && navMarker.token === pending.token && (navMarker.leftSite || navMarker.hiddenAtLeastOnce);
 
                 if (hasReturnFlag && queryStep === pending.step && queryToken === pending.token) {
                     return true;
                 }
 
                 if (hasKnownReferrer) {
+                    return true;
+                }
+
+                if (hasWindowNameMarker && hasNavEvidence) {
                     return true;
                 }
 
@@ -809,6 +848,10 @@
                 if (isFresh && validMarker) {
                     unlockStep(Number(pending.step));
                     clearPendingUnlock();
+                    clearNavMarker();
+                    try {
+                        window.name = '';
+                    } catch (error) {}
                     showToast(`Step ${String(pending.step).padStart(2, '0')} unlocked successfully.`);
                     sanitizeUrlAfterReturn();
                     setTimeout(() => {
@@ -854,8 +897,35 @@
             resetUnlocksBtn.addEventListener('click', () => {
                 localStorage.removeItem(STORAGE_KEY);
                 clearPendingUnlock();
+                clearNavMarker();
+                try {
+                    window.name = '';
+                } catch (error) {}
                 applyUnlockStates();
                 showToast('All unlocked steps were reset on this device.', false);
+            });
+
+            document.addEventListener('visibilitychange', () => {
+                const pending = readPendingUnlock();
+                const navMarker = readNavMarker();
+                if (!pending || !navMarker) return;
+                if (document.visibilityState === 'hidden') {
+                    writeNavMarker({ ...navMarker, hiddenAtLeastOnce: true });
+                }
+            });
+
+            window.addEventListener('pagehide', () => {
+                const pending = readPendingUnlock();
+                const navMarker = readNavMarker();
+                if (!pending || !navMarker) return;
+                writeNavMarker({ ...navMarker, leftSite: true, hiddenAtLeastOnce: true });
+            });
+
+            window.addEventListener('beforeunload', () => {
+                const pending = readPendingUnlock();
+                const navMarker = readNavMarker();
+                if (!pending || !navMarker) return;
+                writeNavMarker({ ...navMarker, leftSite: true, hiddenAtLeastOnce: true });
             });
 
             applyUnlockStates();
