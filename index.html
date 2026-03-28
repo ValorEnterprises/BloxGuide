@@ -567,15 +567,31 @@
         document.addEventListener('DOMContentLoaded', () => {
             const LINKVERTISE_URL = 'https://linkvertise.com/563182/D5zel6LjQ8Na?o=sharing';
             const EXPECTED_LINKVERTISE_PATH = '/563182/D5zel6LjQ8Na';
+            const TOTAL_STEPS = 10;
             const STORAGE_KEY = 'bloxguide-unlocked-steps';
             const PENDING_KEY = 'bloxguide-pending-unlock';
             const NAV_MARKER_KEY = 'bloxguide-nav-away';
             const WINDOW_NAME_KEY = 'BG_PENDING_UNLOCK';
             const RETURN_WINDOW_MS = 1000 * 60 * 30;
-            const MIN_AWAY_MS = 5000;
+            const MIN_AWAY_MS = 3000;
 
-            const stepCards = Array.from(document.querySelectorAll('.step-card[data-step]'));
-            const revealButtons = Array.from(document.querySelectorAll('.reveal-btn'));
+            // Guard against accidental duplicate markup by keeping one card per step.
+            const rawStepCards = Array.from(document.querySelectorAll('.step-card[data-step]'));
+            const seenSteps = new Set();
+            const stepCards = rawStepCards.filter(card => {
+                const step = Number(card.dataset.step);
+                if (!Number.isInteger(step) || step < 1 || step > TOTAL_STEPS) {
+                    card.remove();
+                    return false;
+                }
+                if (seenSteps.has(step)) {
+                    card.remove();
+                    return false;
+                }
+                seenSteps.add(step);
+                return true;
+            });
+            const revealButtons = stepCards.map(card => card.querySelector('.reveal-btn')).filter(Boolean);
             const confirmModal = document.getElementById('confirmModal');
             const confirmYes = document.getElementById('confirmYes');
             const confirmNo = document.getElementById('confirmNo');
@@ -603,11 +619,18 @@
                 observer.observe(card);
             });
 
+            function isValidStep(step) {
+                return Number.isInteger(step) && step >= 1 && step <= TOTAL_STEPS;
+            }
+
             function readUnlockedSteps() {
                 try {
                     const raw = localStorage.getItem(STORAGE_KEY);
                     const parsed = raw ? JSON.parse(raw) : [];
-                    return Array.isArray(parsed) ? parsed.map(Number).filter(Boolean) : [];
+                    if (!Array.isArray(parsed)) return [];
+                    return parsed
+                        .map(Number)
+                        .filter(step => isValidStep(step));
                 } catch (error) {
                     return [];
                 }
@@ -617,17 +640,44 @@
                 localStorage.setItem(STORAGE_KEY, JSON.stringify(Array.from(new Set(steps.map(Number))).sort((a, b) => a - b)));
             }
 
+            function normalizePendingPayload(payload) {
+                if (!payload || typeof payload !== 'object') return null;
+                const step = Number(payload.step);
+                const startedAt = Number(payload.startedAt);
+                const token = String(payload.token || '').trim();
+
+                if (!isValidStep(step) || !Number.isFinite(startedAt) || !token) return null;
+
+                return {
+                    step,
+                    token,
+                    startedAt,
+                    expectedLinkvertiseUrl: String(payload.expectedLinkvertiseUrl || LINKVERTISE_URL),
+                    expectedLinkvertisePath: String(payload.expectedLinkvertisePath || EXPECTED_LINKVERTISE_PATH)
+                };
+            }
+
             function readPendingUnlock() {
                 try {
                     const raw = sessionStorage.getItem(PENDING_KEY) || localStorage.getItem(PENDING_KEY);
-                    return raw ? JSON.parse(raw) : null;
+                    const parsed = raw ? JSON.parse(raw) : null;
+                    const normalized = normalizePendingPayload(parsed);
+                    if (!normalized && raw) {
+                        clearPendingUnlock();
+                        clearNavMarker();
+                    }
+                    return normalized;
                 } catch (error) {
+                    clearPendingUnlock();
+                    clearNavMarker();
                     return null;
                 }
             }
 
             function writePendingUnlock(payload) {
-                const serialized = JSON.stringify(payload);
+                const normalized = normalizePendingPayload(payload);
+                if (!normalized) return;
+                const serialized = JSON.stringify(normalized);
                 sessionStorage.setItem(PENDING_KEY, serialized);
                 localStorage.setItem(PENDING_KEY, serialized);
             }
@@ -639,19 +689,23 @@
 
             function readNavMarker() {
                 try {
-                    const raw = sessionStorage.getItem(NAV_MARKER_KEY);
+                    const raw = sessionStorage.getItem(NAV_MARKER_KEY) || localStorage.getItem(NAV_MARKER_KEY);
                     return raw ? JSON.parse(raw) : null;
                 } catch (error) {
+                    clearNavMarker();
                     return null;
                 }
             }
 
             function writeNavMarker(payload) {
-                sessionStorage.setItem(NAV_MARKER_KEY, JSON.stringify(payload));
+                const serialized = JSON.stringify(payload);
+                sessionStorage.setItem(NAV_MARKER_KEY, serialized);
+                localStorage.setItem(NAV_MARKER_KEY, serialized);
             }
 
             function clearNavMarker() {
                 sessionStorage.removeItem(NAV_MARKER_KEY);
+                localStorage.removeItem(NAV_MARKER_KEY);
             }
 
             function showToast(message, isSuccess = true) {
@@ -705,6 +759,7 @@
             }
 
             function openModal(step) {
+                if (!isValidStep(step)) return;
                 selectedStep = step;
                 modalStepLabel.textContent = `Step ${String(step).padStart(2, '0')}`;
                 confirmModal.classList.remove('hidden');
@@ -775,6 +830,7 @@
             }
 
             function unlockStep(step) {
+                if (!isValidStep(step)) return;
                 const current = readUnlockedSteps();
                 if (!current.includes(step)) {
                     current.push(step);
@@ -784,6 +840,10 @@
             }
 
             function startReveal(step) {
+                if (!isValidStep(step)) {
+                    showToast('Invalid step selection. Please refresh and try again.', false);
+                    return;
+                }
                 const token = crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
                 const startedAt = Date.now();
 
@@ -848,14 +908,17 @@
                 const exactLinkvertiseReferrer = referrerInfo.matchesExactPath;
                 const knownLinkvertiseReferrer = referrerInfo.matchesLinkvertiseHost || referrerInfo.matchesAnyKnownHost;
                 const bfCacheReturn = Boolean(options.persisted) || navigationType === 'back_forward';
+                const genericReturn = (navigationType === 'back_forward' || navigationType === 'reload' || options.reason === 'visibility' || options.reason === 'focus');
+                const stepValid = isValidStep(Number(pending.step));
 
-                const valid = isFresh && (
+                const valid = stepValid && isFresh && (
                     exactLinkvertiseReferrer ||
                     (knownLinkvertiseReferrer && hasAwayEvidence && enoughTimeAway) ||
-                    (bfCacheReturn && hasAwayEvidence && enoughTimeAway && hasWindowNameMarker)
+                    (bfCacheReturn && hasAwayEvidence && enoughTimeAway && hasWindowNameMarker) ||
+                    (genericReturn && hasAwayEvidence && enoughTimeAway && hasWindowNameMarker)
                 );
 
-                const attemptedReturn = exactLinkvertiseReferrer || knownLinkvertiseReferrer || (bfCacheReturn && hasAwayEvidence);
+                const attemptedReturn = exactLinkvertiseReferrer || knownLinkvertiseReferrer || (hasAwayEvidence && (bfCacheReturn || genericReturn));
 
                 return {
                     valid,
@@ -871,19 +934,30 @@
                     return;
                 }
 
-                const verdict = evaluateReturn(pending, options);
-
-                if (verdict.valid) {
-                    unlockStep(Number(pending.step));
+                if (!isValidStep(Number(pending.step))) {
                     clearPendingUnlock();
                     clearNavMarker();
                     try {
                         window.name = '';
                     } catch (error) {}
-                    showToast(`Step ${String(pending.step).padStart(2, '0')} unlocked successfully.`);
+                    sanitizeUrlAfterReturn();
+                    return;
+                }
+
+                const verdict = evaluateReturn(pending, options);
+
+                if (verdict.valid) {
+                    const stepNumber = Number(pending.step);
+                    unlockStep(stepNumber);
+                    clearPendingUnlock();
+                    clearNavMarker();
+                    try {
+                        window.name = '';
+                    } catch (error) {}
+                    showToast(`Step ${String(stepNumber).padStart(2, '0')} unlocked successfully.`);
                     sanitizeUrlAfterReturn();
                     setTimeout(() => {
-                        const card = document.querySelector(`.step-card[data-step="${pending.step}"]`);
+                        const card = document.querySelector(`.step-card[data-step="${stepNumber}"]`);
                         if (card) {
                             card.scrollIntoView({ behavior: 'smooth', block: 'center' });
                         }
@@ -908,8 +982,9 @@
 
             confirmYes.addEventListener('click', () => {
                 if (selectedStep) {
+                    const stepToReveal = selectedStep;
                     closeModal();
-                    startReveal(selectedStep);
+                    startReveal(stepToReveal);
                 }
             });
 
@@ -985,905 +1060,6 @@
 
             applyUnlockStates();
             handleReturnFlow({ reason: 'load' });
-        });
-    </script>
-</body>
-</html>        .lock-overlay {
-            position: absolute;
-            inset: 0;
-            background: linear-gradient(180deg, rgba(2, 6, 23, 0.72), rgba(2, 6, 23, 0.92));
-            backdrop-filter: blur(10px);
-            -webkit-backdrop-filter: blur(10px);
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            padding: 1.5rem;
-            z-index: 4;
-            transition: opacity 0.25s ease, visibility 0.25s ease;
-        }
-        .step-card.unlocked .lock-overlay {
-            opacity: 0;
-            visibility: hidden;
-            pointer-events: none;
-        }
-        .step-card.locked .step-content {
-            filter: blur(10px);
-            user-select: none;
-            pointer-events: none;
-        }
-        .step-card.unlocked .step-content {
-            filter: blur(0);
-            user-select: auto;
-            pointer-events: auto;
-        }
-        .step-card.unlocked {
-            border-color: rgba(34, 197, 94, 0.6);
-            box-shadow: 0 12px 36px -16px rgba(34, 197, 94, 0.35);
-        }
-        .status-chip {
-            border: 1px solid rgba(148, 163, 184, 0.25);
-            background: rgba(15, 23, 42, 0.7);
-        }
-        .free-tag {
-            background: linear-gradient(135deg, #22c55e, #16a34a);
-            box-shadow: 0 0 24px rgba(34, 197, 94, 0.35);
-        }
-        .reveal-btn {
-            min-width: 112px;
-            width: fit-content !important;
-            max-width: 100%;
-            display: inline-flex;
-            align-items: center;
-            justify-content: center;
-            padding: 0.7rem 1rem !important;
-            margin-left: auto;
-            margin-right: auto;
-            font-size: 0.72rem;
-            line-height: 1;
-        }
-        .lock-overlay-inner {
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-        }
-        .modal-backdrop {
-            background: rgba(2, 6, 23, 0.72);
-            backdrop-filter: blur(10px);
-            -webkit-backdrop-filter: blur(10px);
-        }
-        .security-grid {
-            background-image: radial-gradient(circle at top, rgba(239, 68, 68, 0.12), transparent 35%);
-        }
-        .unlock-pulse {
-            box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.5);
-            animation: pulseGlow 2s infinite;
-        }
-        @keyframes pulseGlow {
-            0% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.45); }
-            70% { box-shadow: 0 0 0 16px rgba(239, 68, 68, 0); }
-            100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0); }
-        }
-    </style>
-</head>
-<body class="selection:bg-red-500 selection:text-white">
-
-    <!-- Navigation -->
-    <nav class="fixed w-full z-50 bg-slate-900/80 backdrop-blur-md border-b border-slate-800">
-        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-            <div class="flex justify-between h-16 items-center">
-                <div class="flex items-center gap-2">
-                    <div class="w-8 h-8 roblox-bg-red rounded-lg flex items-center justify-center font-black text-xl italic">B</div>
-                    <span class="font-heading text-2xl tracking-tighter uppercase">Blox<span class="roblox-red">Guide</span></span>
-                </div>
-                <div class="hidden md:flex items-center space-x-4 lg:space-x-8 text-sm font-semibold uppercase tracking-widest">
-                    <a href="#steps" class="hover:text-red-500 transition-colors">The Steps</a>
-                    <a href="#rules" class="hover:text-red-500 transition-colors">Security Rules</a>
-                    <div class="status-chip rounded-full px-4 py-2 text-[11px] text-slate-300">
-                        Unlocked: <span id="navUnlockedCount" class="text-white font-extrabold">0</span>/10
-                    </div>
-                </div>
-            </div>
-        </div>
-    </nav>
-
-    <!-- Hero Section -->
-    <header class="relative pt-32 pb-20 overflow-hidden">
-        <div class="absolute top-0 left-1/2 -translate-x-1/2 w-full h-full -z-10 opacity-20">
-             <div class="absolute inset-0 bg-gradient-to-b from-red-600/20 to-transparent"></div>
-        </div>
-        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 text-center">
-            <div class="inline-flex items-center gap-3 rounded-full border border-red-500/20 bg-slate-900/70 px-4 py-2 text-xs md:text-sm uppercase tracking-[0.25em] text-slate-300 mb-6">
-                <span class="free-tag px-2.5 py-1 rounded-full text-white font-black tracking-wider">Free</span>
-                Step Unlocking Enabled
-            </div>
-            <h1 class="font-heading text-5xl md:text-7xl lg:text-8xl mb-6 tracking-tight leading-none">
-                MASTER THE <br><span class="roblox-red glow-text uppercase">ECONOMY</span>
-            </h1>
-            <p class="max-w-2xl mx-auto text-slate-400 text-lg md:text-xl mb-10">
-                The ultimate roadmap to building wealth on Roblox. Every step is protected by a persistent reveal system so unlocked guides stay available on your device.
-            </p>
-            <div class="flex flex-wrap justify-center gap-4">
-                <a href="#steps" class="px-8 py-4 bg-white text-slate-900 font-bold rounded-xl hover:bg-red-500 hover:text-white transition-all transform hover:scale-105">
-                    Start Learning
-                </a>
-                <a href="#rules" class="px-8 py-4 bg-slate-800 text-white font-bold rounded-xl hover:bg-slate-700 transition-all">
-                    Safety First
-                </a>
-            </div>
-        </div>
-    </header>
-
-    <!-- Unlock Status Panel -->
-    <section class="pb-8">
-        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-            <div class="security-grid rounded-3xl border border-slate-800 bg-slate-900/70 p-6 md:p-8 flex flex-col md:flex-row md:items-center md:justify-between gap-6">
-                <div>
-                    <p class="text-xs uppercase tracking-[0.28em] text-red-400 font-bold mb-2">BloxGuide Security Layer</p>
-                    <h2 class="font-heading text-2xl md:text-3xl uppercase">Persistent Step Unlocking</h2>
-                    <p class="text-slate-400 text-sm md:text-base mt-2 max-w-3xl">
-                        Steps stay unlocked on this device after a successful return flow is detected. A pending reveal alone does not unlock content.
-                    </p>
-                </div>
-                <div class="flex flex-wrap gap-3">
-                    <div class="status-chip rounded-2xl px-5 py-3 min-w-40">
-                        <div class="text-[11px] uppercase tracking-[0.25em] text-slate-400">Unlocked</div>
-                        <div class="text-2xl font-black"><span id="unlockedCount">0</span><span class="text-slate-500">/10</span></div>
-                    </div>
-                    <button id="resetUnlocksBtn" class="rounded-2xl px-5 py-3 bg-slate-800 hover:bg-slate-700 border border-slate-700 text-sm font-bold uppercase tracking-wider transition-colors">
-                        Reset Unlocks
-                    </button>
-                </div>
-            </div>
-        </div>
-    </section>
-
-    <!-- 10 Steps Grid -->
-    <section id="steps" class="py-20 bg-slate-900/50">
-        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-            <div class="mb-16 text-center">
-                <h2 class="font-heading text-3xl md:text-5xl uppercase italic mb-4">The 10 Steps to Wealth</h2>
-                <div class="h-1.5 w-24 roblox-bg-red mx-auto rounded-full"></div>
-            </div>
-
-            <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8">
-                <!-- Step 1 -->
-                <div class="step-card locked p-8 bg-slate-800 border border-slate-700 rounded-3xl relative overflow-hidden" data-step="1" data-title="Master a Skill">
-                    <span class="absolute -top-4 -right-4 text-8xl font-black text-slate-700/30">01</span>
-                    <div class="step-content relative z-[1]">
-                        <h3 class="text-xl font-bold mb-4 roblox-red uppercase tracking-tight">Master a Skill</h3>
-                        <p class="text-slate-400 text-sm leading-relaxed">
-                            The highest-earning players are developers. Use YouTube tutorials to learn Roblox Studio. Skilled scripters or builders can charge <span class="text-white font-bold">5,000 to 50,000+ Robux</span> per commission on talent hubs or Discord servers like HiddenDevs.
-                        </p>
-                    </div>
-                    <div class="lock-overlay">
-                        <div class="lock-overlay-inner text-center max-w-xs w-full">
-                            <div class="mx-auto mb-4 w-16 h-16 rounded-2xl bg-slate-900/80 border border-slate-700 flex items-center justify-center text-red-400">
-                                <svg xmlns="http://www.w3.org/2000/svg" class="w-8 h-8" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M16 11V7a4 4 0 10-8 0v4m-1 0h10a2 2 0 012 2v5a2 2 0 01-2 2H7a2 2 0 01-2-2v-5a2 2 0 012-2z" />
-                                </svg>
-                            </div>
-                            <p class="text-xs uppercase tracking-[0.28em] text-slate-400 mb-2">Step 01 Locked</p>
-                            <p class="font-bold text-white text-lg mb-4">Reveal this guide</p>
-                            <div class="flex items-center justify-center gap-2 mb-4 flex-wrap">
-                                <span class="free-tag text-white text-[11px] font-black uppercase tracking-[0.25em] px-3 py-1 rounded-full">Free</span>
-                                <span class="text-xs text-slate-400 uppercase tracking-[0.2em]">Persistent unlock</span>
-                            </div>
-                            <button class="reveal-btn unlock-pulse roblox-bg-red rounded-xl text-white font-black uppercase tracking-[0.22em] hover:bg-red-600 transition-colors" data-step="1">Reveal</button>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- Step 2 -->
-                <div class="step-card locked p-8 bg-slate-800 border border-slate-700 rounded-3xl relative overflow-hidden" data-step="2" data-title="Clothing Store">
-                    <span class="absolute -top-4 -right-4 text-8xl font-black text-slate-700/30">02</span>
-                    <div class="step-content relative z-[1]">
-                        <h3 class="text-xl font-bold mb-4 roblox-red uppercase tracking-tight">Clothing Store</h3>
-                        <p class="text-slate-400 text-sm leading-relaxed">
-                            Create classic shirts and pants or apply for the UGC program. While it costs 10 Robux to upload, a trending design can sell thousands of copies, providing <span class="text-white font-bold">passive income</span> while you sleep.
-                        </p>
-                    </div>
-                    <div class="lock-overlay">
-                        <div class="text-center max-w-xs w-full">
-                            <div class="mx-auto mb-4 w-16 h-16 rounded-2xl bg-slate-900/80 border border-slate-700 flex items-center justify-center text-red-400">
-                                <svg xmlns="http://www.w3.org/2000/svg" class="w-8 h-8" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M16 11V7a4 4 0 10-8 0v4m-1 0h10a2 2 0 012 2v5a2 2 0 01-2 2H7a2 2 0 01-2-2v-5a2 2 0 012-2z" />
-                                </svg>
-                            </div>
-                            <p class="text-xs uppercase tracking-[0.28em] text-slate-400 mb-2">Step 02 Locked</p>
-                            <p class="font-bold text-white text-lg mb-4">Reveal this guide</p>
-                            <div class="flex items-center justify-center gap-2 mb-4">
-                                <span class="free-tag text-white text-[11px] font-black uppercase tracking-[0.25em] px-3 py-1 rounded-full">Free</span>
-                                <span class="text-xs text-slate-400 uppercase tracking-[0.2em]">Persistent unlock</span>
-                            </div>
-                            <button class="reveal-btn unlock-pulse roblox-bg-red rounded-xl text-white font-black uppercase tracking-[0.22em] hover:bg-red-600 transition-colors" data-step="2">Reveal</button>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- Step 3 -->
-                <div class="step-card locked p-8 bg-slate-800 border border-slate-700 rounded-3xl relative overflow-hidden" data-step="3" data-title="Donation Games">
-                    <span class="absolute -top-4 -right-4 text-8xl font-black text-slate-700/30">03</span>
-                    <div class="step-content relative z-[1]">
-                        <h3 class="text-xl font-bold mb-4 roblox-red uppercase tracking-tight">Donation Games</h3>
-                        <p class="text-slate-400 text-sm leading-relaxed">
-                            Play "PLS DONATE" or "Hungry Artists." Don't just beg; offer value. Stand out by having a <span class="text-white font-bold">high-effort stand</span>, being funny, or offering "services" like drawing avatars. Fastest way to your first 100 Robux.
-                        </p>
-                    </div>
-                    <div class="lock-overlay">
-                        <div class="text-center max-w-xs w-full">
-                            <div class="mx-auto mb-4 w-16 h-16 rounded-2xl bg-slate-900/80 border border-slate-700 flex items-center justify-center text-red-400">
-                                <svg xmlns="http://www.w3.org/2000/svg" class="w-8 h-8" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M16 11V7a4 4 0 10-8 0v4m-1 0h10a2 2 0 012 2v5a2 2 0 01-2 2H7a2 2 0 01-2-2v-5a2 2 0 012-2z" />
-                                </svg>
-                            </div>
-                            <p class="text-xs uppercase tracking-[0.28em] text-slate-400 mb-2">Step 03 Locked</p>
-                            <p class="font-bold text-white text-lg mb-4">Reveal this guide</p>
-                            <div class="flex items-center justify-center gap-2 mb-4">
-                                <span class="free-tag text-white text-[11px] font-black uppercase tracking-[0.25em] px-3 py-1 rounded-full">Free</span>
-                                <span class="text-xs text-slate-400 uppercase tracking-[0.2em]">Persistent unlock</span>
-                            </div>
-                            <button class="reveal-btn unlock-pulse w-full px-4 py-3 roblox-bg-red rounded-2xl text-white font-black uppercase tracking-[0.22em] hover:bg-red-600 transition-colors" data-step="3">Reveal</button>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- Step 4 -->
-                <div class="step-card locked p-8 bg-slate-800 border border-slate-700 rounded-3xl relative overflow-hidden" data-step="4" data-title="Trading Limiteds">
-                    <span class="absolute -top-4 -right-4 text-8xl font-black text-slate-700/30">04</span>
-                    <div class="step-content relative z-[1]">
-                        <h3 class="text-xl font-bold mb-4 roblox-red uppercase tracking-tight">Trading Limiteds</h3>
-                        <p class="text-slate-400 text-sm leading-relaxed">
-                            With Roblox Premium, you can trade "Limited" items. Buy low and sell high. Use sites like <span class="text-white font-bold">Rolimon's</span> to track values. Requires patience and market knowledge to avoid "projected" scams.
-                        </p>
-                    </div>
-                    <div class="lock-overlay">
-                        <div class="text-center max-w-xs w-full">
-                            <div class="mx-auto mb-4 w-16 h-16 rounded-2xl bg-slate-900/80 border border-slate-700 flex items-center justify-center text-red-400">
-                                <svg xmlns="http://www.w3.org/2000/svg" class="w-8 h-8" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M16 11V7a4 4 0 10-8 0v4m-1 0h10a2 2 0 012 2v5a2 2 0 01-2 2H7a2 2 0 01-2-2v-5a2 2 0 012-2z" />
-                                </svg>
-                            </div>
-                            <p class="text-xs uppercase tracking-[0.28em] text-slate-400 mb-2">Step 04 Locked</p>
-                            <p class="font-bold text-white text-lg mb-4">Reveal this guide</p>
-                            <div class="flex items-center justify-center gap-2 mb-4">
-                                <span class="free-tag text-white text-[11px] font-black uppercase tracking-[0.25em] px-3 py-1 rounded-full">Free</span>
-                                <span class="text-xs text-slate-400 uppercase tracking-[0.2em]">Persistent unlock</span>
-                            </div>
-                            <button class="reveal-btn unlock-pulse w-full px-4 py-3 roblox-bg-red rounded-2xl text-white font-black uppercase tracking-[0.22em] hover:bg-red-600 transition-colors" data-step="4">Reveal</button>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- Step 5 -->
-                <div class="step-card locked p-8 bg-slate-800 border border-slate-700 rounded-3xl relative overflow-hidden" data-step="5" data-title="Flipping Limited U">
-                    <span class="absolute -top-4 -right-4 text-8xl font-black text-slate-700/30">05</span>
-                    <div class="step-content relative z-[1]">
-                        <h3 class="text-xl font-bold mb-4 roblox-red uppercase tracking-tight">Flipping Limited U</h3>
-                        <p class="text-slate-400 text-sm leading-relaxed">
-                            Roblox releases "Limited U" items frequently. If you buy at launch, value often <span class="text-white font-bold">triples within hours</span>. Monitor Roblox leaks accounts on Twitter (X) for drop times.
-                        </p>
-                    </div>
-                    <div class="lock-overlay">
-                        <div class="text-center max-w-xs w-full">
-                            <div class="mx-auto mb-4 w-16 h-16 rounded-2xl bg-slate-900/80 border border-slate-700 flex items-center justify-center text-red-400">
-                                <svg xmlns="http://www.w3.org/2000/svg" class="w-8 h-8" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M16 11V7a4 4 0 10-8 0v4m-1 0h10a2 2 0 012 2v5a2 2 0 01-2 2H7a2 2 0 01-2-2v-5a2 2 0 012-2z" />
-                                </svg>
-                            </div>
-                            <p class="text-xs uppercase tracking-[0.28em] text-slate-400 mb-2">Step 05 Locked</p>
-                            <p class="font-bold text-white text-lg mb-4">Reveal this guide</p>
-                            <div class="flex items-center justify-center gap-2 mb-4">
-                                <span class="free-tag text-white text-[11px] font-black uppercase tracking-[0.25em] px-3 py-1 rounded-full">Free</span>
-                                <span class="text-xs text-slate-400 uppercase tracking-[0.2em]">Persistent unlock</span>
-                            </div>
-                            <button class="reveal-btn unlock-pulse w-full px-4 py-3 roblox-bg-red rounded-2xl text-white font-black uppercase tracking-[0.22em] hover:bg-red-600 transition-colors" data-step="5">Reveal</button>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- Step 6 -->
-                <div class="step-card locked p-8 bg-slate-800 border border-slate-700 rounded-3xl relative overflow-hidden" data-step="6" data-title="GFX & Art">
-                    <span class="absolute -top-4 -right-4 text-8xl font-black text-slate-700/30">06</span>
-                    <div class="step-content relative z-[1]">
-                        <h3 class="text-xl font-bold mb-4 roblox-red uppercase tracking-tight">GFX & Art</h3>
-                        <p class="text-slate-400 text-sm leading-relaxed">
-                            If you are good at Blender or Photoshop, create "GFX" (avatar renders) for thumbnails or profile pictures. High-end artists can earn <span class="text-white font-bold">thousands of Robux</span> for a single piece of promotional art.
-                        </p>
-                    </div>
-                    <div class="lock-overlay">
-                        <div class="text-center max-w-xs w-full">
-                            <div class="mx-auto mb-4 w-16 h-16 rounded-2xl bg-slate-900/80 border border-slate-700 flex items-center justify-center text-red-400">
-                                <svg xmlns="http://www.w3.org/2000/svg" class="w-8 h-8" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M16 11V7a4 4 0 10-8 0v4m-1 0h10a2 2 0 012 2v5a2 2 0 01-2 2H7a2 2 0 01-2-2v-5a2 2 0 012-2z" />
-                                </svg>
-                            </div>
-                            <p class="text-xs uppercase tracking-[0.28em] text-slate-400 mb-2">Step 06 Locked</p>
-                            <p class="font-bold text-white text-lg mb-4">Reveal this guide</p>
-                            <div class="flex items-center justify-center gap-2 mb-4">
-                                <span class="free-tag text-white text-[11px] font-black uppercase tracking-[0.25em] px-3 py-1 rounded-full">Free</span>
-                                <span class="text-xs text-slate-400 uppercase tracking-[0.2em]">Persistent unlock</span>
-                            </div>
-                            <button class="reveal-btn unlock-pulse w-full px-4 py-3 roblox-bg-red rounded-2xl text-white font-black uppercase tracking-[0.22em] hover:bg-red-600 transition-colors" data-step="6">Reveal</button>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- Step 7 -->
-                <div class="step-card locked p-8 bg-slate-800 border border-slate-700 rounded-3xl relative overflow-hidden" data-step="7" data-title="High-Retention Games">
-                    <span class="absolute -top-4 -right-4 text-8xl font-black text-slate-700/30">07</span>
-                    <div class="step-content relative z-[1]">
-                        <h3 class="text-xl font-bold mb-4 roblox-red uppercase tracking-tight">High-Retention Games</h3>
-                        <p class="text-slate-400 text-sm leading-relaxed">
-                            Obbies or Tycoons are easier to make. Focus on <span class="text-white font-bold">Gamepasses</span> (2x Speed, Gravity Coils). Even a small player base can generate significant revenue through developer products.
-                        </p>
-                    </div>
-                    <div class="lock-overlay">
-                        <div class="text-center max-w-xs w-full">
-                            <div class="mx-auto mb-4 w-16 h-16 rounded-2xl bg-slate-900/80 border border-slate-700 flex items-center justify-center text-red-400">
-                                <svg xmlns="http://www.w3.org/2000/svg" class="w-8 h-8" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M16 11V7a4 4 0 10-8 0v4m-1 0h10a2 2 0 012 2v5a2 2 0 01-2 2H7a2 2 0 01-2-2v-5a2 2 0 012-2z" />
-                                </svg>
-                            </div>
-                            <p class="text-xs uppercase tracking-[0.28em] text-slate-400 mb-2">Step 07 Locked</p>
-                            <p class="font-bold text-white text-lg mb-4">Reveal this guide</p>
-                            <div class="flex items-center justify-center gap-2 mb-4">
-                                <span class="free-tag text-white text-[11px] font-black uppercase tracking-[0.25em] px-3 py-1 rounded-full">Free</span>
-                                <span class="text-xs text-slate-400 uppercase tracking-[0.2em]">Persistent unlock</span>
-                            </div>
-                            <button class="reveal-btn unlock-pulse w-full px-4 py-3 roblox-bg-red rounded-2xl text-white font-black uppercase tracking-[0.22em] hover:bg-red-600 transition-colors" data-step="7">Reveal</button>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- Step 8 -->
-                <div class="step-card locked p-8 bg-slate-800 border border-slate-700 rounded-3xl relative overflow-hidden" data-step="8" data-title="Microsoft Rewards">
-                    <span class="absolute -top-4 -right-4 text-8xl font-black text-slate-700/30">08</span>
-                    <div class="step-content relative z-[1]">
-                        <h3 class="text-xl font-bold mb-4 roblox-red uppercase tracking-tight">Microsoft Rewards</h3>
-                        <p class="text-slate-400 text-sm leading-relaxed">
-                            A 100% legal way to get Robux. By using Bing and daily tasks on the <span class="text-white font-bold">Microsoft Rewards</span> site, you earn points redeemable for official 100-1,000 Robux gift card codes.
-                        </p>
-                    </div>
-                    <div class="lock-overlay">
-                        <div class="text-center max-w-xs w-full">
-                            <div class="mx-auto mb-4 w-16 h-16 rounded-2xl bg-slate-900/80 border border-slate-700 flex items-center justify-center text-red-400">
-                                <svg xmlns="http://www.w3.org/2000/svg" class="w-8 h-8" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M16 11V7a4 4 0 10-8 0v4m-1 0h10a2 2 0 012 2v5a2 2 0 01-2 2H7a2 2 0 01-2-2v-5a2 2 0 012-2z" />
-                                </svg>
-                            </div>
-                            <p class="text-xs uppercase tracking-[0.28em] text-slate-400 mb-2">Step 08 Locked</p>
-                            <p class="font-bold text-white text-lg mb-4">Reveal this guide</p>
-                            <div class="flex items-center justify-center gap-2 mb-4">
-                                <span class="free-tag text-white text-[11px] font-black uppercase tracking-[0.25em] px-3 py-1 rounded-full">Free</span>
-                                <span class="text-xs text-slate-400 uppercase tracking-[0.2em]">Persistent unlock</span>
-                            </div>
-                            <button class="reveal-btn unlock-pulse w-full px-4 py-3 roblox-bg-red rounded-2xl text-white font-black uppercase tracking-[0.22em] hover:bg-red-600 transition-colors" data-step="8">Reveal</button>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- Step 9 -->
-                <div class="step-card locked p-8 bg-slate-800 border border-slate-700 rounded-3xl relative overflow-hidden" data-step="9" data-title="Manage a Group">
-                    <span class="absolute -top-4 -right-4 text-8xl font-black text-slate-700/30">09</span>
-                    <div class="step-content relative z-[1]">
-                        <h3 class="text-xl font-bold mb-4 roblox-red uppercase tracking-tight">Manage a Group</h3>
-                        <p class="text-slate-400 text-sm leading-relaxed">
-                            Start a group around a niche (fan club, military RP). Sell uniforms and ranks. <span class="text-white font-bold">Group funds</span> are easier to manage and can be paid out to yourself or contributors instantly.
-                        </p>
-                    </div>
-                    <div class="lock-overlay">
-                        <div class="text-center max-w-xs w-full">
-                            <div class="mx-auto mb-4 w-16 h-16 rounded-2xl bg-slate-900/80 border border-slate-700 flex items-center justify-center text-red-400">
-                                <svg xmlns="http://www.w3.org/2000/svg" class="w-8 h-8" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M16 11V7a4 4 0 10-8 0v4m-1 0h10a2 2 0 012 2v5a2 2 0 01-2 2H7a2 2 0 01-2-2v-5a2 2 0 012-2z" />
-                                </svg>
-                            </div>
-                            <p class="text-xs uppercase tracking-[0.28em] text-slate-400 mb-2">Step 09 Locked</p>
-                            <p class="font-bold text-white text-lg mb-4">Reveal this guide</p>
-                            <div class="flex items-center justify-center gap-2 mb-4">
-                                <span class="free-tag text-white text-[11px] font-black uppercase tracking-[0.25em] px-3 py-1 rounded-full">Free</span>
-                                <span class="text-xs text-slate-400 uppercase tracking-[0.2em]">Persistent unlock</span>
-                            </div>
-                            <button class="reveal-btn unlock-pulse w-full px-4 py-3 roblox-bg-red rounded-2xl text-white font-black uppercase tracking-[0.22em] hover:bg-red-600 transition-colors" data-step="9">Reveal</button>
-                        </div>
-                    </div>
-                </div>
-            </div>
-
-            <!-- Step 10 (Centered and Larger) -->
-            <div class="mt-8 max-w-2xl mx-auto">
-                <div class="step-card locked p-10 bg-gradient-to-br from-red-600 to-red-900 rounded-3xl relative overflow-hidden border border-red-400/20" data-step="10" data-title="Reinvest Your Earnings">
-                    <span class="absolute -top-4 -right-4 text-9xl font-black text-white/10">10</span>
-                    <div class="step-content relative z-[1]">
-                        <h3 class="text-2xl font-bold mb-4 text-white uppercase tracking-tight">Reinvest Your Earnings</h3>
-                        <p class="text-white/90 text-sm leading-relaxed mb-4 font-medium italic">
-                            Do not spend your first 1,000 Robux on avatar items. Use them to:
-                        </p>
-                        <ul class="grid grid-cols-1 md:grid-cols-2 gap-3 text-sm font-bold text-white uppercase">
-                            <li class="flex items-center gap-2"><div class="w-2 h-2 bg-white rounded-full"></div> Advertise your game</li>
-                            <li class="flex items-center gap-2"><div class="w-2 h-2 bg-white rounded-full"></div> Buy Premium (Trade)</li>
-                            <li class="flex items-center gap-2"><div class="w-2 h-2 bg-white rounded-full"></div> Hire a Specialist</li>
-                            <li class="flex items-center gap-2"><div class="w-2 h-2 bg-white rounded-full"></div> Upload more designs</li>
-                        </ul>
-                    </div>
-                    <div class="lock-overlay bg-[linear-gradient(180deg,rgba(127,29,29,0.55),rgba(2,6,23,0.92))]">
-                        <div class="text-center max-w-xs w-full">
-                            <div class="mx-auto mb-4 w-16 h-16 rounded-2xl bg-slate-950/70 border border-white/15 flex items-center justify-center text-white">
-                                <svg xmlns="http://www.w3.org/2000/svg" class="w-8 h-8" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M16 11V7a4 4 0 10-8 0v4m-1 0h10a2 2 0 012 2v5a2 2 0 01-2 2H7a2 2 0 01-2-2v-5a2 2 0 012-2z" />
-                                </svg>
-                            </div>
-                            <p class="text-xs uppercase tracking-[0.28em] text-white/70 mb-2">Step 10 Locked</p>
-                            <p class="font-bold text-white text-lg mb-4">Reveal this guide</p>
-                            <div class="flex items-center justify-center gap-2 mb-4">
-                                <span class="free-tag text-white text-[11px] font-black uppercase tracking-[0.25em] px-3 py-1 rounded-full">Free</span>
-                                <span class="text-xs text-white/70 uppercase tracking-[0.2em]">Persistent unlock</span>
-                            </div>
-                            <button class="reveal-btn unlock-pulse w-full px-4 py-3 bg-white text-red-700 rounded-2xl font-black uppercase tracking-[0.22em] hover:bg-slate-200 transition-colors" data-step="10">Reveal</button>
-                        </div>
-                    </div>
-                </div>
-            </div>
-        </div>
-    </section>
-
-    <!-- Important Rules Section -->
-    <section id="rules" class="py-20 bg-slate-950 border-t border-slate-800">
-        <div class="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8">
-            <div class="bg-slate-900 border-2 border-red-500/50 rounded-4xl p-8 md:p-12 shadow-[0_0_50px_rgba(239,68,68,0.1)]">
-                <h2 class="font-heading text-3xl mb-8 roblox-red flex items-center gap-3">
-                    <svg xmlns="http://www.w3.org/2000/svg" class="h-10 w-10" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
-                    </svg>
-                    IMPORTANT RULES
-                </h2>
-                
-                <div class="space-y-6">
-                    <div class="flex gap-4">
-                        <div class="flex-shrink-0 w-12 h-12 bg-red-500/10 rounded-full flex items-center justify-center text-red-500 font-bold">1</div>
-                        <div>
-                            <p class="text-lg font-bold text-slate-100">Roblox takes a 30% cut</p>
-                            <p class="text-slate-400">This applies to all sales including donations, clothing, and gamepasses. Factor this into your pricing.</p>
-                        </div>
-                    </div>
-                    
-                    <div class="flex gap-4">
-                        <div class="flex-shrink-0 w-12 h-12 bg-red-500/10 rounded-full flex items-center justify-center text-red-500 font-bold">2</div>
-                        <div>
-                            <p class="text-lg font-bold text-slate-100">Avoid "Free Robux" Scams</p>
-                            <p class="text-slate-400 italic">Never click links promising "Free Robux." They are almost always scams or cookie loggers designed to steal your account.</p>
-                        </div>
-                    </div>
-
-                    <div class="flex gap-4">
-                        <div class="flex-shrink-0 w-12 h-12 bg-red-500/10 rounded-full flex items-center justify-center text-red-500 font-bold">3</div>
-                        <div>
-                            <p class="text-lg font-bold text-slate-100">Consistency is Key</p>
-                            <p class="text-slate-400">Luck is rare. Success comes from treating your Roblox presence like a small business. Keep creating and improving.</p>
-                        </div>
-                    </div>
-
-                </div>
-            </div>
-        </div>
-    </section>
-
-    <!-- Footer -->
-    <footer class="py-12 border-t border-slate-800 text-center">
-        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-            <div class="flex items-center justify-center gap-2 mb-4 opacity-50">
-                <div class="w-6 h-6 roblox-bg-red rounded flex items-center justify-center font-black text-xs italic">B</div>
-                <span class="font-heading text-xl tracking-tighter uppercase">Blox<span class="roblox-red">Guide</span></span>
-            </div>
-            <p class="text-slate-500 text-sm italic">
-                &copy; 2026 BloxGuide. Not affiliated with Roblox Corporation. 
-                <br>Go build something amazing.
-            </p>
-        </div>
-    </footer>
-
-    <!-- Confirm Modal -->
-    <div id="confirmModal" class="fixed inset-0 z-[100] hidden items-center justify-center px-4">
-        <div class="modal-backdrop absolute inset-0"></div>
-        <div class="relative w-full max-w-lg rounded-3xl border border-slate-700 bg-slate-900 shadow-2xl overflow-hidden">
-            <div class="p-6 md:p-8">
-                <div class="flex items-center gap-3 mb-4">
-                    <div class="w-12 h-12 rounded-2xl roblox-bg-red flex items-center justify-center text-white">
-                        <svg xmlns="http://www.w3.org/2000/svg" class="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12A9 9 0 113 12a9 9 0 0118 0z" />
-                        </svg>
-                    </div>
-                    <div>
-                        <p class="text-xs uppercase tracking-[0.26em] text-red-400 font-bold">Reveal Confirmation</p>
-                        <h3 class="text-2xl font-black text-white">Continue to unlock?</h3>
-                    </div>
-                </div>
-                <p class="text-slate-300 leading-relaxed text-base">
-                    Redirecting to Linkvertise, Complete and automatically redirect back to BloxGuide.
-                </p>
-                <p class="text-slate-500 text-sm mt-3">
-                    Pending unlock: <span id="modalStepLabel" class="text-white font-bold">Step 01</span>
-                </p>
-                <div class="mt-6 flex flex-col sm:flex-row gap-3">
-                    <button id="confirmYes" class="flex-1 px-5 py-3 roblox-bg-red hover:bg-red-600 rounded-2xl text-white font-black uppercase tracking-[0.22em] transition-colors">Yes</button>
-                    <button id="confirmNo" class="flex-1 px-5 py-3 bg-slate-800 hover:bg-slate-700 rounded-2xl text-white font-black uppercase tracking-[0.22em] transition-colors">No</button>
-                </div>
-            </div>
-        </div>
-    </div>
-
-    <!-- Toast -->
-    <div id="toast" class="fixed bottom-5 right-5 z-[110] hidden max-w-sm rounded-2xl border border-slate-700 bg-slate-900/95 backdrop-blur px-5 py-4 shadow-2xl">
-        <p id="toastText" class="text-sm text-slate-100 font-semibold"></p>
-    </div>
-
-    <script>
-        document.addEventListener('DOMContentLoaded', () => {
-            const LINKVERTISE_URL = 'https://link-target.net/563182/D5zel6LjQ8Na';
-            const STORAGE_KEY = 'bloxguide-unlocked-steps';
-            const PENDING_KEY = 'bloxguide-pending-unlock';
-            const LAST_RETURN_KEY = 'bloxguide-last-return';
-            const RETURN_WINDOW_MS = 1000 * 60 * 30;
-            const NAV_MARKER_KEY = 'bloxguide-nav-away';
-            const WINDOW_NAME_KEY = 'BG_PENDING_UNLOCK';
-
-            const stepCards = Array.from(document.querySelectorAll('.step-card[data-step]'));
-            const revealButtons = Array.from(document.querySelectorAll('.reveal-btn'));
-            const confirmModal = document.getElementById('confirmModal');
-            const confirmYes = document.getElementById('confirmYes');
-            const confirmNo = document.getElementById('confirmNo');
-            const modalStepLabel = document.getElementById('modalStepLabel');
-            const unlockedCount = document.getElementById('unlockedCount');
-            const navUnlockedCount = document.getElementById('navUnlockedCount');
-            const resetUnlocksBtn = document.getElementById('resetUnlocksBtn');
-            const toast = document.getElementById('toast');
-            const toastText = document.getElementById('toastText');
-            let selectedStep = null;
-
-            const observerOptions = { threshold: 0.1 };
-            const observer = new IntersectionObserver((entries) => {
-                entries.forEach(entry => {
-                    if (entry.isIntersecting) {
-                        entry.target.classList.add('opacity-100');
-                        entry.target.classList.remove('opacity-0', 'translate-y-10');
-                    }
-                });
-            }, observerOptions);
-
-            stepCards.forEach(card => {
-                card.classList.add('opacity-0', 'translate-y-10', 'transition-all', 'duration-700');
-                observer.observe(card);
-            });
-
-            function readUnlockedSteps() {
-                try {
-                    const raw = localStorage.getItem(STORAGE_KEY);
-                    const parsed = raw ? JSON.parse(raw) : [];
-                    return Array.isArray(parsed) ? parsed.map(Number).filter(Boolean) : [];
-                } catch (error) {
-                    return [];
-                }
-            }
-
-            function writeUnlockedSteps(steps) {
-                localStorage.setItem(STORAGE_KEY, JSON.stringify(Array.from(new Set(steps.map(Number))).sort((a, b) => a - b)));
-            }
-
-            function readPendingUnlock() {
-                try {
-                    const raw = sessionStorage.getItem(PENDING_KEY) || localStorage.getItem(PENDING_KEY);
-                    return raw ? JSON.parse(raw) : null;
-                } catch (error) {
-                    return null;
-                }
-            }
-
-            function writePendingUnlock(payload) {
-                const serialized = JSON.stringify(payload);
-                sessionStorage.setItem(PENDING_KEY, serialized);
-                localStorage.setItem(PENDING_KEY, serialized);
-            }
-
-            function clearPendingUnlock() {
-                sessionStorage.removeItem(PENDING_KEY);
-                localStorage.removeItem(PENDING_KEY);
-                localStorage.removeItem(LAST_RETURN_KEY);
-            }
-
-            function showToast(message, isSuccess = true) {
-                toastText.textContent = message;
-                toast.classList.remove('hidden');
-                toast.classList.toggle('border-emerald-500/40', isSuccess);
-                toast.classList.toggle('border-red-500/40', !isSuccess);
-                toast.classList.toggle('bg-emerald-950/90', isSuccess);
-                toast.classList.toggle('bg-red-950/90', !isSuccess);
-                setTimeout(() => {
-                    toast.classList.add('hidden');
-                }, 3600);
-            }
-
-            function updateProgress() {
-                const unlocked = readUnlockedSteps();
-                unlockedCount.textContent = unlocked.length;
-                navUnlockedCount.textContent = unlocked.length;
-            }
-
-            function applyUnlockStates() {
-                const unlocked = readUnlockedSteps();
-                stepCards.forEach(card => {
-                    const step = Number(card.dataset.step);
-                    const button = card.querySelector('.reveal-btn');
-                    if (unlocked.includes(step)) {
-                        card.classList.remove('locked');
-                        card.classList.add('unlocked');
-                        if (button) {
-                            button.textContent = 'Unlocked';
-                            button.disabled = true;
-                            button.classList.remove('unlock-pulse', 'roblox-bg-red', 'hover:bg-red-600', 'bg-white', 'text-red-700', 'hover:bg-slate-200');
-                            button.classList.add('bg-emerald-500', 'hover:bg-emerald-500', 'cursor-default');
-                        }
-                    } else {
-                        card.classList.add('locked');
-                        card.classList.remove('unlocked');
-                        if (button) {
-                            button.textContent = 'Reveal';
-                            button.disabled = false;
-                            if (step === 10) {
-                                button.className = 'reveal-btn unlock-pulse w-full px-4 py-3 bg-white text-red-700 rounded-2xl font-black uppercase tracking-[0.22em] hover:bg-slate-200 transition-colors';
-                            } else {
-                                button.className = 'reveal-btn unlock-pulse w-full px-4 py-3 roblox-bg-red rounded-2xl text-white font-black uppercase tracking-[0.22em] hover:bg-red-600 transition-colors';
-                            }
-                            button.dataset.step = String(step);
-                        }
-                    }
-                });
-                updateProgress();
-            }
-
-            function openModal(step) {
-                selectedStep = step;
-                modalStepLabel.textContent = `Step ${String(step).padStart(2, '0')}`;
-                confirmModal.classList.remove('hidden');
-                confirmModal.classList.add('flex');
-            }
-
-            function closeModal() {
-                confirmModal.classList.add('hidden');
-                confirmModal.classList.remove('flex');
-                selectedStep = null;
-            }
-
-            function buildReturnUrl(step, token) {
-                const url = new URL(window.location.href);
-                url.searchParams.set('bg_step', String(step));
-                url.searchParams.set('bg_token', token);
-                url.searchParams.set('bg_return', '1');
-                return url.toString();
-            }
-
-            function startReveal(step) {
-                const token = crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-                const payload = {
-                    step,
-                    token,
-                    startedAt: Date.now(),
-                    expectedReturnUrl: buildReturnUrl(step, token)
-                };
-                writePendingUnlock(payload);
-                localStorage.setItem(LAST_RETURN_KEY, JSON.stringify({ step, token, startedAt: payload.startedAt }));
-                sessionStorage.setItem(NAV_MARKER_KEY, JSON.stringify({
-                    step,
-                    token,
-                    startedAt: payload.startedAt,
-                    leftSite: false,
-                    hiddenAtLeastOnce: false
-                }));
-
-                try {
-                    window.name = `${WINDOW_NAME_KEY}:${token}:${step}`;
-                } catch (error) {}
-
-                const directUrl = LINKVERTISE_URL;
-                const fallbackLink = document.createElement('a');
-                fallbackLink.href = directUrl;
-                fallbackLink.target = '_self';
-                fallbackLink.rel = 'noopener';
-                fallbackLink.style.display = 'none';
-                document.body.appendChild(fallbackLink);
-
-                try {
-                    if (window.top && window.top !== window) {
-                        window.top.location.href = directUrl;
-                        return;
-                    }
-                } catch (error) {}
-
-                try {
-                    window.location.assign(directUrl);
-                } catch (error) {}
-
-                setTimeout(() => {
-                    try {
-                        window.location.href = directUrl;
-                    } catch (error) {}
-                }, 40);
-
-                setTimeout(() => {
-                    try {
-                        window.location.replace(directUrl);
-                    } catch (error) {}
-                }, 120);
-
-                setTimeout(() => {
-                    try {
-                        fallbackLink.click();
-                    } catch (error) {}
-                }, 220);
-            }
-
-            function sanitizeUrlAfterReturn() {
-                const url = new URL(window.location.href);
-                const keys = ['bg_step', 'bg_token', 'bg_return'];
-                let changed = false;
-                keys.forEach(key => {
-                    if (url.searchParams.has(key)) {
-                        url.searchParams.delete(key);
-                        changed = true;
-                    }
-                });
-                if (changed) {
-                    window.history.replaceState({}, document.title, url.toString());
-                }
-            }
-
-            function unlockStep(step) {
-                const current = readUnlockedSteps();
-                if (!current.includes(step)) {
-                    current.push(step);
-                    writeUnlockedSteps(current);
-                }
-                applyUnlockStates();
-            }
-
-            function readNavMarker() {
-                try {
-                    const raw = sessionStorage.getItem(NAV_MARKER_KEY);
-                    return raw ? JSON.parse(raw) : null;
-                } catch (error) {
-                    return null;
-                }
-            }
-
-            function writeNavMarker(payload) {
-                sessionStorage.setItem(NAV_MARKER_KEY, JSON.stringify(payload));
-            }
-
-            function clearNavMarker() {
-                sessionStorage.removeItem(NAV_MARKER_KEY);
-            }
-
-            function hasReturnMarkers(pending) {
-                const url = new URL(window.location.href);
-                const queryStep = Number(url.searchParams.get('bg_step'));
-                const queryToken = url.searchParams.get('bg_token');
-                const hasReturnFlag = url.searchParams.get('bg_return') === '1';
-                const referrer = document.referrer || '';
-                const hasKnownReferrer = /linkvertise|link-target\.net|link-center\.net|link-hub\.net/i.test(referrer);
-                const navMarker = readNavMarker();
-                const windowName = String(window.name || '');
-                const hasWindowNameMarker = windowName === `${WINDOW_NAME_KEY}:${pending.token}:${pending.step}`;
-                const hasNavEvidence = !!navMarker && Number(navMarker.step) === Number(pending.step) && navMarker.token === pending.token && (navMarker.leftSite || navMarker.hiddenAtLeastOnce);
-
-                if (hasReturnFlag && queryStep === pending.step && queryToken === pending.token) {
-                    return true;
-                }
-
-                if (hasKnownReferrer) {
-                    return true;
-                }
-
-                if (hasWindowNameMarker && hasNavEvidence) {
-                    return true;
-                }
-
-                return false;
-            }
-
-            function handleReturnFlow() {
-                const pending = readPendingUnlock();
-                if (!pending) {
-                    sanitizeUrlAfterReturn();
-                    return;
-                }
-
-                const isFresh = Date.now() - Number(pending.startedAt || 0) <= RETURN_WINDOW_MS;
-                const validMarker = hasReturnMarkers(pending);
-
-                if (isFresh && validMarker) {
-                    unlockStep(Number(pending.step));
-                    clearPendingUnlock();
-                    clearNavMarker();
-                    try {
-                        window.name = '';
-                    } catch (error) {}
-                    showToast(`Step ${String(pending.step).padStart(2, '0')} unlocked successfully.`);
-                    sanitizeUrlAfterReturn();
-                    setTimeout(() => {
-                        const card = document.querySelector(`.step-card[data-step="${pending.step}"]`);
-                        if (card) {
-                            card.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                        }
-                    }, 250);
-                    return;
-                }
-
-                const url = new URL(window.location.href);
-                const attemptedReturn = url.searchParams.get('bg_return') === '1' || /linkvertise|link-target\.net|link-center\.net|link-hub\.net/i.test(document.referrer || '');
-                if (attemptedReturn && !validMarker) {
-                    showToast('Return detected, but unlock verification failed. The step remains locked.', false);
-                    sanitizeUrlAfterReturn();
-                }
-            }
-
-            revealButtons.forEach(button => {
-                button.addEventListener('click', () => {
-                    const step = Number(button.dataset.step);
-                    const unlocked = readUnlockedSteps();
-                    if (unlocked.includes(step)) return;
-                    openModal(step);
-                });
-            });
-
-            confirmYes.addEventListener('click', () => {
-                if (selectedStep) {
-                    closeModal();
-                    startReveal(selectedStep);
-                }
-            });
-
-            confirmNo.addEventListener('click', closeModal);
-            confirmModal.addEventListener('click', (event) => {
-                if (event.target === confirmModal || event.target.classList.contains('modal-backdrop')) {
-                    closeModal();
-                }
-            });
-
-            resetUnlocksBtn.addEventListener('click', () => {
-                localStorage.removeItem(STORAGE_KEY);
-                clearPendingUnlock();
-                clearNavMarker();
-                try {
-                    window.name = '';
-                } catch (error) {}
-                applyUnlockStates();
-                showToast('All unlocked steps were reset on this device.', false);
-            });
-
-            document.addEventListener('visibilitychange', () => {
-                const pending = readPendingUnlock();
-                const navMarker = readNavMarker();
-                if (!pending || !navMarker) return;
-                if (document.visibilityState === 'hidden') {
-                    writeNavMarker({ ...navMarker, hiddenAtLeastOnce: true });
-                }
-            });
-
-            window.addEventListener('pagehide', () => {
-                const pending = readPendingUnlock();
-                const navMarker = readNavMarker();
-                if (!pending || !navMarker) return;
-                writeNavMarker({ ...navMarker, leftSite: true, hiddenAtLeastOnce: true });
-            });
-
-            window.addEventListener('beforeunload', () => {
-                const pending = readPendingUnlock();
-                const navMarker = readNavMarker();
-                if (!pending || !navMarker) return;
-                writeNavMarker({ ...navMarker, leftSite: true, hiddenAtLeastOnce: true });
-            });
-
-            applyUnlockStates();
-            handleReturnFlow();
         });
     </script>
 </body>
